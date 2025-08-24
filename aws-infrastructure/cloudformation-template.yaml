@@ -1,0 +1,358 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Internal Docs Q&A Agent Infrastructure'
+
+Parameters:
+  BucketName:
+    Type: String
+    Default: internal-docs-qa-bucket
+    Description: S3 bucket name for storing documents
+  
+  AgentName:
+    Type: String
+    Default: internal-docs-qa-agent
+    Description: Name for the Bedrock Agent
+
+Resources:
+  # S3 Bucket for Document Storage
+  DocumentsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Ref BucketName
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+
+  # IAM Role for Lambda Functions
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: S3Access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:ListBucket
+                Resource:
+                  - !Sub '${DocumentsBucket}/*'
+                  - !GetAtt DocumentsBucket.Arn
+        - PolicyName: BedrockAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - bedrock:InvokeAgent
+                  - bedrock:InvokeModel
+                Resource: '*'
+
+  # IAM Role for Bedrock Agent
+  BedrockAgentRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: bedrock.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: S3Access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:ListBucket
+                Resource:
+                  - !Sub '${DocumentsBucket}/*'
+                  - !GetAtt DocumentsBucket.Arn
+        - PolicyName: LambdaInvoke
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - lambda:InvokeFunction
+                Resource: !GetAtt DocumentRetrievalFunction.Arn
+
+  # Lambda Function for Query Processing
+  QueryProcessorFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: query-processor
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 30
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import logging
+          from datetime import datetime
+
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          bedrock_agent = boto3.client('bedrock-agent-runtime')
+
+          def lambda_handler(event, context):
+              try:
+                  body = json.loads(event.get('body', '{}'))
+                  user_query = body.get('query', '')
+                  session_id = body.get('sessionId', f"session-{datetime.now().timestamp()}")
+                  
+                  if not user_query:
+                      return {
+                          'statusCode': 400,
+                          'headers': {
+                              'Content-Type': 'application/json',
+                              'Access-Control-Allow-Origin': '*'
+                          },
+                          'body': json.dumps({'error': 'Query is required'})
+                      }
+                  
+                  # Placeholder for Bedrock Agent call
+                  # Replace with actual agent ID after creation
+                  fallback_response = (
+                      "I'm sorry, I couldn't process your query at the moment. "
+                      "Please contact our support team:\n\n"
+                      "📞 Company Helpline: 8500\n"
+                      "📧 Email: company.ac.in.com"
+                  )
+                  
+                  return {
+                      'statusCode': 200,
+                      'headers': {
+                          'Content-Type': 'application/json',
+                          'Access-Control-Allow-Origin': '*'
+                      },
+                      'body': json.dumps({
+                          'response': fallback_response,
+                          'sessionId': session_id,
+                          'timestamp': datetime.now().isoformat()
+                      })
+                  }
+                  
+              except Exception as e:
+                  logger.error(f"Error: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'headers': {
+                          'Content-Type': 'application/json',
+                          'Access-Control-Allow-Origin': '*'
+                      },
+                      'body': json.dumps({'error': 'Internal server error'})
+                  }
+
+  # Lambda Function for Document Retrieval
+  DocumentRetrievalFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: document-retrieval-function
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 30
+      Environment:
+        Variables:
+          BUCKET_NAME: !Ref DocumentsBucket
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import logging
+          import os
+
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          s3_client = boto3.client('s3')
+
+          def lambda_handler(event, context):
+              try:
+                  action_group = event.get('actionGroup', '')
+                  function_name = event.get('function', '')
+                  parameters = event.get('parameters', [])
+                  
+                  if function_name == 'get_policy_document':
+                      return get_policy_document(parameters)
+                  elif function_name == 'search_policies':
+                      return search_policies(parameters)
+                  else:
+                      return create_response('Function not found')
+                      
+              except Exception as e:
+                  logger.error(f"Error: {str(e)}")
+                  return create_response(f'Error: {str(e)}')
+
+          def get_policy_document(parameters):
+              bucket_name = os.environ['BUCKET_NAME']
+              
+              policy_type = None
+              for param in parameters:
+                  if param.get('name') == 'policy_type':
+                      policy_type = param.get('value')
+                      break
+              
+              if not policy_type:
+                  return create_response('Please specify the policy type')
+              
+              policy_files = {
+                  'hr': 'HR_Policies_Notion.md',
+                  'it': 'IT_Policies_Confluence.html',
+                  'marketing': 'Marketing_Policies_Notion.md'
+              }
+              
+              file_key = policy_files.get(policy_type.lower())
+              if not file_key:
+                  return create_response('Policy type not found')
+              
+              try:
+                  response = s3_client.get_object(Bucket=bucket_name, Key=file_key)
+                  content = response['Body'].read().decode('utf-8')
+                  return create_response(f"Retrieved {policy_type} policy:\n\n{content}")
+              except Exception as e:
+                  return create_response(f"Error retrieving document: {str(e)}")
+
+          def search_policies(parameters):
+              return create_response("Search functionality not implemented yet")
+
+          def create_response(body_text):
+              return {
+                  'response': {
+                      'actionGroup': 'DocumentRetrieval',
+                      'function': 'get_policy_document',
+                      'functionResponse': {
+                          'responseBody': {
+                              'TEXT': {
+                                  'body': body_text
+                              }
+                          }
+                      }
+                  }
+              }
+
+  # API Gateway
+  ApiGateway:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: internal-docs-api
+      Description: API for Internal Docs Q&A Agent
+      EndpointConfiguration:
+        Types:
+          - REGIONAL
+
+  # API Gateway Resource
+  QueryResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref ApiGateway
+      ParentId: !GetAtt ApiGateway.RootResourceId
+      PathPart: query
+
+  # API Gateway Method
+  QueryMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref ApiGateway
+      ResourceId: !Ref QueryResource
+      HttpMethod: POST
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${QueryProcessorFunction.Arn}/invocations'
+      MethodResponses:
+        - StatusCode: 200
+          ResponseHeaders:
+            Access-Control-Allow-Origin: true
+
+  # CORS Options Method
+  QueryOptionsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref ApiGateway
+      ResourceId: !Ref QueryResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE
+      Integration:
+        Type: MOCK
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseHeaders:
+              Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token'"
+              Access-Control-Allow-Methods: "'POST,OPTIONS'"
+              Access-Control-Allow-Origin: "'*'"
+            ResponseTemplates:
+              application/json: ''
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+      MethodResponses:
+        - StatusCode: 200
+          ResponseHeaders:
+            Access-Control-Allow-Headers: true
+            Access-Control-Allow-Methods: true
+            Access-Control-Allow-Origin: true
+
+  # Lambda Permission for API Gateway
+  LambdaApiGatewayPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref QueryProcessorFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub '${ApiGateway}/*/POST/query'
+
+  # API Gateway Deployment
+  ApiDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn:
+      - QueryMethod
+      - QueryOptionsMethod
+    Properties:
+      RestApiId: !Ref ApiGateway
+      StageName: prod
+
+Outputs:
+  ApiEndpoint:
+    Description: API Gateway endpoint URL
+    Value: !Sub 'https://${ApiGateway}.execute-api.${AWS::Region}.amazonaws.com/prod'
+    Export:
+      Name: !Sub '${AWS::StackName}-ApiEndpoint'
+
+  S3BucketName:
+    Description: S3 bucket name for documents
+    Value: !Ref DocumentsBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-S3Bucket'
+
+  LambdaRoleArn:
+    Description: Lambda execution role ARN
+    Value: !GetAtt LambdaExecutionRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-LambdaRole'
+
+  BedrockRoleArn:
+    Description: Bedrock agent role ARN
+    Value: !GetAtt BedrockAgentRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-BedrockRole'
